@@ -1,0 +1,33 @@
+digraph arch {
+  rankdir=LR; nodesep=0.25; ranksep=0.45;
+  node [shape=box, style="rounded,filled", fillcolor="#ffffff", color="#9a998f", fontname="DejaVu Sans", fontsize=10];
+  edge [color="#6b6a63", arrowsize=0.6];
+
+  users [label="Students\n(10,000 users,\npeak 500 req/s)", shape=ellipse, fillcolor="#eef4fc", color="#2a78d6"];
+
+  subgraph cluster_edge { label="Edge (managed, 2 zones)"; fontname="DejaVu Sans"; fontsize=9; style="dashed"; color="#c3c2b7";
+    lb1 [label="Load Balancer A"]; lb2 [label="Load Balancer B\n(added)", color="#1baf7a", penwidth=2];
+  }
+  subgraph cluster_gw { label="API Gateway (TLS, auth check,\nroute, timeout 450 ms, 1 retry)"; fontname="DejaVu Sans"; fontsize=9; style="dashed"; color="#c3c2b7";
+    gw1 [label="Gateway pod 1"]; gw2 [label="Gateway pod 2\n(added)", color="#1baf7a", penwidth=2];
+  }
+  subgraph cluster_k8s { label="Kubernetes cluster — pods spread across 2 nodes / zones"; fontname="DejaVu Sans"; fontsize=9; style="dashed"; color="#c3c2b7";
+    auth [label="Auth service\n2 replicas"];
+    course [label="Course service\n2 replicas\n+ read cache"];
+    reg [label="Registration service\n2 replicas (HPA 2–6)", color="#2a78d6", penwidth=2];
+  }
+  subgraph cluster_db { label="Database (2 nodes)"; fontname="DejaVu Sans"; fontsize=9; style="dashed"; color="#c3c2b7";
+    dbp [label="Primary", shape=cylinder];
+    dbs [label="Standby\n(synchronous replica)", shape=cylinder];
+  }
+  backup [label="Backups in another region\nfull daily + WAL every 1 min", shape=folder, fillcolor="#fff6e8", color="#eda100"];
+  git [label="Git repo\n(YAML + config)", shape=folder, fillcolor="#fff6e8", color="#eda100"];
+
+  users -> {lb1 lb2};
+  {lb1 lb2} -> {gw1 gw2};
+  {gw1 gw2} -> {auth course reg};
+  {auth course reg} -> dbp;
+  dbp -> dbs [label=" replication", fontsize=8, style=dashed];
+  dbp -> backup [style=dashed, fontsize=8];
+  git -> reg [style=dotted, label=" kubectl apply", fontsize=8];
+}

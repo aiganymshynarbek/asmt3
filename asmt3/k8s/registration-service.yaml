@@ -1,0 +1,199 @@
+# =====================================================================
+# Assignment 3 - AITU Digital Student Services (SYNTHETIC, educational)
+# Registration Service - Kubernetes resilience configuration
+# File: k8s/registration-service.yaml
+#
+# Nothing here is real AITU infrastructure: the namespace, image,
+# hostnames and secret values are placeholders.
+# =====================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: student-services
+---
+# Non-secret configuration (backed up with the rest of the manifests in Git)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registration-config
+  namespace: student-services
+data:
+  DB_HOST: "registration-db-primary.student-services.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "registration"
+  DB_CONNECT_TIMEOUT_MS: "2000"      # fail fast instead of hanging
+  REQUEST_TIMEOUT_MS: "450"          # stays under the 500 ms latency target
+  SHUTDOWN_GRACE_SECONDS: "20"
+---
+# Placeholder secret - real values would come from a secret manager,
+# never from Git.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: registration-db-credentials
+  namespace: student-services
+type: Opaque
+stringData:
+  DB_USER: "registration_app"
+  DB_PASSWORD: "CHANGE_ME_SYNTHETIC_PLACEHOLDER"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registration
+  namespace: student-services
+  labels:
+    app: registration
+    tier: backend
+spec:
+  replicas: 2                        # REQUIREMENT: 2 replicas
+  revisionHistoryLimit: 5            # keep old versions for quick rollback
+  selector:
+    matchLabels:
+      app: registration
+  strategy:
+    type: RollingUpdate              # REQUIREMENT: rolling update
+    rollingUpdate:
+      maxUnavailable: 0              # never drop below 2 ready pods during a deploy
+      maxSurge: 1                    # start 1 new pod before stopping an old one
+  minReadySeconds: 10                # new pod must stay ready 10 s before it counts
+  progressDeadlineSeconds: 180       # a stuck rollout is marked failed after 3 min
+  template:
+    metadata:
+      labels:
+        app: registration
+        tier: backend
+    spec:
+      restartPolicy: Always          # REQUIREMENT: automatic restart (kubelet restarts crashed containers)
+      terminationGracePeriodSeconds: 30
+      # Spread the 2 replicas over different nodes and zones so one
+      # machine failure cannot take both down.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: registration
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: registration
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: registration
+          image: registry.example.edu/student-services/registration:1.4.2   # synthetic image
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: registration-config
+            - secretRef:
+                name: registration-db-credentials
+          # REQUIREMENT: resource requests and limits
+          resources:
+            requests:
+              cpu: "250m"            # guaranteed share, used by the scheduler
+              memory: "256Mi"
+            limits:
+              cpu: "1"               # cap so one pod cannot starve its neighbours
+              memory: "512Mi"        # above this the container is OOM-killed and restarted
+          # Gives slow JVM/app start-up time before liveness can kill it
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30     # up to 60 s allowed for start-up
+          # REQUIREMENT: readiness probe - "may I receive traffic?"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2      # removed from Service after ~10 s of failures
+            successThreshold: 1
+          # REQUIREMENT: liveness probe - "is the process stuck?"
+          # Checks the process only, NOT the database (avoids a restart storm
+          # when the DB is down - see Part D, experiment 3).
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3      # restarted after ~30 s of being stuck
+          lifecycle:
+            preStop:
+              exec:
+                # let the Service stop routing before the process exits
+                command: ["sh", "-c", "sleep 5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# REQUIREMENT: service discovery - stable DNS name
+#   registration.student-services.svc.cluster.local:80
+# The API Gateway calls this name; Kubernetes keeps the list of READY
+# pod IPs behind it up to date automatically.
+apiVersion: v1
+kind: Service
+metadata:
+  name: registration
+  namespace: student-services
+  labels:
+    app: registration
+spec:
+  type: ClusterIP
+  selector:
+    app: registration
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Voluntary disruptions (node drain, cluster upgrade) may evict at most
+# one replica at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: registration-pdb
+  namespace: student-services
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: registration
+---
+# Optional: scale out during the registration-week peak (2 is the floor).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: registration-hpa
+  namespace: student-services
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: registration
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
